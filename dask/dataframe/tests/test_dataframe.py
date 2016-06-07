@@ -109,6 +109,9 @@ def test_attributes():
     assert 'foo' not in dir(d)
     assert raises(AttributeError, lambda: d.foo)
 
+    df = dd.from_pandas(pd.DataFrame({'a b c': [1, 2, 3]}), npartitions=2)
+    assert 'a b c' not in dir(df)
+
 
 def test_column_names():
     tm.assert_index_equal(d.columns, pd.Index(['a', 'b']))
@@ -610,7 +613,6 @@ def test_empty_quantile():
 
 
 def test_dataframe_quantile():
-
     # column X is for test column order and result division
     df = pd.DataFrame({'A': np.arange(20),
                        'X': np.arange(20, 40),
@@ -707,10 +709,6 @@ def test_loc_with_series():
 
     assert sorted(d.loc[d.a % 2].dask) == sorted(d.loc[d.a % 2].dask)
     assert sorted(d.loc[d.a % 2].dask) != sorted(d.loc[d.a % 3].dask)
-
-
-def test_iloc_raises():
-    assert raises(NotImplementedError, lambda: d.iloc[:5])
 
 
 def test_getitem():
@@ -1241,6 +1239,8 @@ def test_embarrassingly_parallel_operations():
 
     assert eq(a.x.notnull(), df.x.notnull())
     assert eq(a.x.isnull(), df.x.isnull())
+    assert eq(a.notnull(), df.notnull())
+    assert eq(a.isnull(), df.isnull())
 
     assert len(a.sample(0.5).compute()) < len(df)
 
@@ -1653,31 +1653,39 @@ def test_dataframe_itertuples():
 
 
 def test_from_delayed():
-    from dask import do
-    dfs = [do(tm.makeTimeDataFrame)(i) for i in range(1, 5)]
-    df = dd.from_delayed(dfs, columns=['A', 'B', 'C', 'D'])
+    from dask import delayed
+    dfs = [delayed(tm.makeTimeDataFrame)(i) for i in range(1, 5)]
+    df = dd.from_delayed(dfs, metadata=['A', 'B', 'C', 'D'])
 
     assert (df.compute().columns == df.columns).all()
     assert list(df.map_partitions(len).compute()) == [1, 2, 3, 4]
 
     ss = [df.A for df in dfs]
-    s = dd.from_delayed(ss, columns='A')
+    s = dd.from_delayed(ss, metadata='A')
 
     assert s.compute().name == s.name
     assert list(s.map_partitions(len).compute()) == [1, 2, 3, 4]
+
+    s = dd.from_delayed(ss)
+    assert s._known_dtype
+    assert s.compute().name == s.name
 
     df = dd.from_delayed(dfs, tm.makeTimeDataFrame(1))
     assert df._known_dtype
     assert list(df.columns) == ['A', 'B', 'C', 'D']
 
+    df = dd.from_delayed(dfs)
+    assert df._known_dtype
+    assert list(df.columns) == ['A', 'B', 'C', 'D']
+
 
 def test_to_delayed():
-    from dask.delayed import Value
+    from dask.delayed import Delayed
     df = pd.DataFrame({'x': [1, 2, 3, 4], 'y': [10, 20, 30, 40]})
     ddf = dd.from_pandas(df, npartitions=2)
     a, b = ddf.to_delayed()
-    assert isinstance(a, Value)
-    assert isinstance(b, Value)
+    assert isinstance(a, Delayed)
+    assert isinstance(b, Delayed)
 
     assert eq(a.compute(), df.iloc[:2])
 
@@ -1733,3 +1741,21 @@ def test_methods_tokenize_differently():
     df = dd.from_pandas(df, npartitions=1)
     assert (df.x.map_partitions(pd.Series.min)._name !=
             df.x.map_partitions(pd.Series.max)._name)
+
+
+def test_sorted_index_single_partition():
+    df = pd.DataFrame({'x': [1, 2, 3, 4], 'y': [1, 0, 1, 0]})
+    ddf = dd.from_pandas(df, npartitions=1)
+    eq(ddf.set_index('x', sorted=True),
+        df.set_index('x'))
+
+
+def test_info(capsys):
+    df = pd.DataFrame({'long_column_name': [1, 2, 3, 4], 'short_name': [1, 0, 1, 0]})
+    ddf = dd.from_pandas(df, npartitions=1)
+    ddf.info()
+    out, err = capsys.readouterr()
+    assert out == ("<class 'dask.dataframe.core.DataFrame'>\n"
+                  "Data columns (total 2 columns):\n"
+                  "long_column_name    int64\n"
+                  "short_name          int64\n")

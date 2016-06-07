@@ -76,7 +76,7 @@ def slices_from_chunks(chunks):
                 for start, shape in zip(starts, shapes)]
 
 
-def getem(arr, chunks, shape=None):
+def getem(arr, chunks, shape=None, out_name=None):
     """ Dask getting various chunks from an array-like
 
     >>> getem('X', chunks=(2, 3), shape=(4, 6))  # doctest: +SKIP
@@ -91,9 +91,10 @@ def getem(arr, chunks, shape=None):
      ('X', 1, 1): (getarray, 'X', (slice(2, 4), slice(3, 6))),
      ('X', 0, 1): (getarray, 'X', (slice(0, 2), slice(3, 6)))}
     """
+    out_name = out_name or arr
     chunks = normalize_chunks(chunks, shape)
 
-    keys = list(product([arr], *[range(len(bds)) for bds in chunks]))
+    keys = list(product([out_name], *[range(len(bds)) for bds in chunks]))
 
     values = [(getarray, arr, x) for x in slices_from_chunks(chunks)]
 
@@ -250,15 +251,15 @@ def top(func, output, out_indices, *arrind_pairs, **kwargs):
     dasks.  We arrange the pattern with which those blocks interact with sets
     of matching indices.  E.g.
 
-        top(func, 'z', 'i', 'x', 'i', 'y', 'i')
+        ``top(func, 'z', 'i', 'x', 'i', 'y', 'i')``
 
     yield an embarassingly parallel communication pattern and is read as
 
-        z_i = func(x_i, y_i)
+        $$ z_i = func(x_i, y_i) $$
 
     More complex patterns may emerge, including multiple indices
 
-        top(func, 'z', 'ij', 'x', 'ij', 'y', 'ji')
+        ``top(func, 'z', 'ij', 'x', 'ij', 'y', 'ji')``
 
         $$ z_{ij} = func(x_{ij}, y_{ji}) $$
 
@@ -1496,13 +1497,15 @@ def from_array(x, chunks, name=None, lock=False):
     if len(chunks) != len(x.shape):
         raise ValueError("Input array has %d dimensions but the supplied "
                 "chunks has only %d dimensions" % (len(x.shape), len(chunks)))
-    name = name or 'from-array-' + tokenize(x, chunks)
-    dsk = getem(name, chunks)
+    token = tokenize(x, chunks)
+    original_name = (name or 'array-') + 'original-' + token
+    name = name or 'array-' + token
+    dsk = getem(original_name, chunks, out_name=name)
     if lock is True:
         lock = Lock()
     if lock:
         dsk = dict((k, v + (lock,)) for k, v in dsk.items())
-    return Array(merge({name: x}, dsk), name, chunks, dtype=x.dtype)
+    return Array(merge({original_name: x}, dsk), name, chunks, dtype=x.dtype)
 
 
 def from_imperative(*args, **kwargs):
@@ -3315,12 +3318,14 @@ def to_npy_stack(dirname, x, axis=0):
     >>> x = da.ones((5, 10, 10), chunks=(2, 4, 4))  # doctest: +SKIP
     >>> da.to_npy_stack('data/', x, axis=0)  # doctest: +SKIP
 
+    ```bash
     $ tree data/
     data/
     |-- 0.npy
     |-- 1.npy
     |-- 2.npy
     |-- info
+    ```
 
     The ``.npy`` files store numpy arrays for ``x[0:2], x[2:4], and x[4:5]``
     respectively, as is specified by the chunk size along the zeroth axis.  The

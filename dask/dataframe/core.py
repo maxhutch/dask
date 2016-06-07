@@ -43,8 +43,6 @@ def _concat(args, **kwargs):
         return args
     if isinstance(first(core.flatten(args)), np.ndarray):
         return da.core.concatenate3(args)
-    if len(args) == 1:
-        return args[0]
     if isinstance(args[0], (pd.DataFrame, pd.Series)):
         args2 = [arg for arg in args if len(arg)]
         if not args2:
@@ -73,7 +71,7 @@ class Scalar(Base):
 
     _optimize = staticmethod(optimize)
     _default_get = staticmethod(threaded.get)
-    _finalize = staticmethod(finalize)
+    _finalize = staticmethod(first)
 
     def __init__(self, dsk, _name, name=None, divisions=None):
         self.dask = dsk
@@ -457,13 +455,8 @@ class _Frame(Base):
         >>> df.loc["b":"d"]  # doctest: +SKIP"""
         return IndexCallable(self._loc)
 
-    @property
-    def iloc(self):
-        """ Not implemented """
-
-        # not implemented because of performance concerns.
-        # see https://github.com/dask/dask/pull/507
-        raise NotImplementedError("Dask Dataframe does not support iloc")
+    # NOTE: `iloc` is not implemented because of performance concerns.
+    # see https://github.com/dask/dask/pull/507
 
     def repartition(self, divisions=None, npartitions=None, force=False):
         """ Repartition dataframe along new divisions
@@ -561,8 +554,8 @@ class _Frame(Base):
 
         Returns a list of values, one value per partition.
         """
-        from ..delayed import Value
-        return [Value(k, [self.dask]) for k in self._keys()]
+        from ..delayed import Delayed
+        return [Delayed(k, [self.dask]) for k in self._keys()]
 
     @classmethod
     def _get_unary_operator(cls, op):
@@ -1093,9 +1086,10 @@ class Series(_Frame):
         uniques : Series
         """
         # unique returns np.ndarray, it must be wrapped
-        chunk = lambda x: pd.Series(pd.Series.unique(x), name=self.name)
+        name = self.name
+        chunk = lambda x: pd.Series(pd.Series.unique(x), name=name)
         return aca(self, chunk=chunk, aggregate=chunk,
-                   columns=self.name, token='unique')
+                   columns=name, token='unique')
 
     @derived_from(pd.Series)
     def nunique(self):
@@ -1395,7 +1389,7 @@ class DataFrame(_Frame):
 
     def __dir__(self):
         return sorted(set(dir(type(self)) + list(self.__dict__) +
-                      list(self.columns)))
+                      list(filter(pd.compat.isidentifier, self.columns))))
 
     @property
     def ndim(self):
@@ -1411,8 +1405,16 @@ class DataFrame(_Frame):
             self._pd, self._known_dtype = self._build_pd(self.head())
             return self._pd.dtypes
 
+    @derived_from(pd.DataFrame)
+    def notnull(self):
+        return self.map_partitions(pd.DataFrame.notnull)
+
+    @derived_from(pd.DataFrame)
+    def isnull(self):
+        return self.map_partitions(pd.DataFrame.isnull)
+
     def set_index(self, other, drop=True, sorted=False, **kwargs):
-        """ Set the DataFrame index 9row labels) using an existing column
+        """ Set the DataFrame index (row labels) using an existing column
 
         This operation in dask.dataframe is expensive.  If the input column is
         sorted then we accomplish the set_index in a single full read of that
@@ -1748,6 +1750,22 @@ class DataFrame(_Frame):
         empty = self._pd.astype(dtype)
         return map_partitions(pd.DataFrame.astype, empty, self, dtype=dtype)
 
+    def info(self):
+        """
+        Concise summary of a Dask DataFrame.
+        """
+        lines = list()
+        lines.append(str(type(self)))
+        lines.append('Data columns (total %d columns):' % len(self.columns))
+        dtypes = self.dtypes
+        space = max([len(k) for k in self.columns]) + 4
+        template = "%s%s"
+        for i, col in enumerate(self.columns):
+            dtype = dtypes.iloc[i]
+            lines.append(template % (('%s' % col)[:space].ljust(space), dtype))
+
+        print('\n'.join(lines))
+
 
 # bind operators
 for op in [operator.abs, operator.add, operator.and_, operator_div,
@@ -1945,7 +1963,7 @@ def reduction(x, chunk, aggregate, token=None):
     token = token or 'reduction'
     a = '{0}--chunk-{1}'.format(token, token_key)
     dsk = dict(((a, i), (empty_safe, chunk, (x._name, i)))
-                for i in range(x.npartitions))
+               for i in range(x.npartitions))
 
     b = '{0}--aggregation-{1}'.format(token, token_key)
     dsk2 = {(b, 0): (aggregate, (remove_empties,
@@ -2228,7 +2246,8 @@ def quantile(df, q):
         if issubclass(return_type, Index):
             return_type = Series
     else:
-        merge_type = lambda v: df._partition_type(v).item()
+        typ = df._partition_type
+        merge_type = lambda v: typ(v).item()
         return_type = df._constructor_sliced
         q = [q]
 

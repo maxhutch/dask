@@ -237,7 +237,8 @@ def from_bcolz(x, chunksize=None, categorize=True, index=None, lock=lock,
                  columns, categories, lock))
                for i in range(0, int(ceil(len(x) / chunksize))))
 
-    result = DataFrame(dsk, new_name, columns, divisions)
+    meta = dataframe_from_ctable(x, slice(0, 0), columns, categories, lock)
+    result = DataFrame(dsk, new_name, meta, divisions)
 
     if index:
         assert index in x.names
@@ -400,23 +401,39 @@ def _link(token, result):
 @wraps(pd.DataFrame.to_hdf)
 def to_hdf(df, path_or_buf, key, mode='a', append=False, complevel=0,
            complib=None, fletcher32=False, get=get_sync, dask_kwargs=None,
-           **kwargs):
+           name_function=str, **kwargs):
     name = 'to-hdf-' + uuid.uuid1().hex
 
     pd_to_hdf = getattr(df._partition_type, 'to_hdf')
 
+    # if path_or_buf is string, format using i and name
+    if isinstance(path_or_buf, str):
+        if path_or_buf.count('*') + key.count('*') > 1:
+            raise ValueError("A maximum of one asterisk is accepted in file path and dataset key")
+
+        fmt_obj = lambda path_or_buf, i_name: path_or_buf.replace('*', i_name)
+    else:
+        if key.count('*') > 1:
+            raise ValueError("A maximum of one asterisk is accepted in dataset key")
+
+        fmt_obj = lambda path_or_buf, _: path_or_buf
+
     dsk = dict()
+    i_name = name_function(0)
     dsk[(name, 0)] = (_link, None,
                       (apply, pd_to_hdf,
-                          (tuple, [(df._name, 0), path_or_buf, key]),
+                          (tuple, [(df._name, 0), fmt_obj(path_or_buf, i_name),
+                              key.replace('*', i_name)]),
                           merge(kwargs,
                             {'mode':  mode, 'format': 'table', 'append': append,
                              'complevel': complevel, 'complib': complib,
                              'fletcher32': fletcher32})))
     for i in range(1, df.npartitions):
+        i_name = name_function(i)
         dsk[(name, i)] = (_link, (name, i - 1),
                           (apply, pd_to_hdf,
-                           (tuple, [(df._name, i), path_or_buf, key]),
+                           (tuple, [(df._name, i), fmt_obj(path_or_buf, i_name),
+                               key.replace('*', i_name)]),
                            merge(kwargs,
                              {'mode': 'a', 'format': 'table', 'append': True,
                               'complevel': complevel, 'complib': complib,
@@ -490,9 +507,6 @@ def _read_single_hdf(path, key, start=0, stop=None, columns=None,
         divisions = [None] * (len(dsk) + 1)
         return DataFrame(dsk, name, empty, divisions)
 
-    if lock is True:
-        lock = Lock()
-
     keys, stops = get_keys_and_stops(path, key, stop)
     if (start != 0 or stop is not None) and len(keys) > 1:
         raise NotImplementedError(read_hdf_error_msg)
@@ -550,6 +564,9 @@ def read_hdf(pattern, key, start=0, stop=None, columns=None,
 
     >>> dd.read_hdf('myfile.1.hdf5', '/*')  # doctest: +SKIP
     """
+    if lock is True:
+        lock = Lock()
+
     key = key if key.startswith('/')  else '/' + key
     paths = sorted(glob(pattern))
     if (start != 0 or stop is not None) and len(paths) > 1:
@@ -645,16 +662,24 @@ def from_delayed(dfs, metadata=None, divisions=None, columns=None,
     Parameters
     ----------
     dfs: list of Values
-        An iterable of dask.delayed.Value objects, such as come from dask.do
-        These comprise the individual partitions of the resulting dataframe
-    metadata: list or string of column names or empty dataframe
-    divisions: list or None
+        An iterable of ``dask.delayed.Delayed`` objects, such as come from
+        ``dask.delayed`` These comprise the individual partitions of the
+        resulting dataframe.
+    metadata: str, list of column names, or empty dataframe, optional
+        Metadata for the underlying pandas object. Can be either column name
+        (if Series), list of column names, or pandas object with the same
+        columns/dtypes. If not provided, will be computed from the first
+        partition.
+    divisions: list, optional
+        Partition boundaries along the index.
+    prefix, str, optional
+        Prefix to prepend to the keys.
     """
     if columns is not None:
         warn("Deprecation warning: Use metadata argument, not columns")
         metadata = columns
-    from dask.delayed import Value
-    if isinstance(dfs, Value):
+    from dask.delayed import Delayed
+    if isinstance(dfs, Delayed):
         dfs = [dfs]
     dsk = merge(df.dask for df in dfs)
 
@@ -665,8 +690,10 @@ def from_delayed(dfs, metadata=None, divisions=None, columns=None,
 
     if divisions is None:
         divisions = [None] * (len(dfs) + 1)
+    if metadata is None:
+        metadata = dfs[0].compute()
 
-    if isinstance(metadata, str):
+    if isinstance(metadata, (str, pd.Series)):
         return Series(merge(dsk, dsk2), name, metadata, divisions)
     else:
         return DataFrame(merge(dsk, dsk2), name, metadata, divisions)

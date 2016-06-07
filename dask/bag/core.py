@@ -7,19 +7,25 @@ import math
 import os
 import uuid
 from warnings import warn
+from distutils.version import LooseVersion
 
 from ..utils import ignoring
 
 from toolz import (merge, take, reduce, valmap, map, partition_all, filter,
-        remove, compose, curry)
+                   remove, compose, curry, first, second, accumulate)
 from toolz.compatibility import iteritems, zip
 import toolz
+_implement_accumulate = LooseVersion(toolz.__version__) > '0.7.4'
 try:
+    import cytoolz
     from cytoolz import (frequencies, merge_with, join, reduceby,
                          count, pluck, groupby, topk)
+    if LooseVersion(cytoolz.__version__) > '0.7.3':
+        from cytoolz import accumulate
+        _implement_accumulate = True
 except:
     from toolz import (frequencies, merge_with, join, reduceby,
-                         count, pluck, groupby, topk)
+                       count, pluck, groupby, topk)
 
 from ..base import Base, normalize_token, tokenize
 from ..compatibility import apply, unicode, urlopen
@@ -320,11 +326,11 @@ class Bag(Base):
         >>> list(b.map(lambda x: x * 10))  # doctest: +SKIP
         [0, 10, 20, 30, 40]
 
-        Keyword arguments are passed through to `func`. These can be either
-        `dask.bag.Item`s, or normal python objects.
+        Keyword arguments are passed through to ``func``. These can be either
+        ``dask.bag.Item``, or normal python objects.
 
-        Example
-        -------
+        Examples
+        --------
         >>> import dask.bag as db
         >>> b = db.from_sequence(range(1, 101), npartitions=10)
         >>> def div(num, den=1):
@@ -338,7 +344,7 @@ class Bag(Base):
         >>> b.map(div, den=hi).take(5)
         (0.01, 0.02, 0.03, 0.04, 0.05)
 
-        Using an `Item`:
+        Using an ``Item``:
 
         >>> b.map(div, den=b.max()).take(5)
         (0.01, 0.02, 0.03, 0.04, 0.05)
@@ -406,11 +412,11 @@ class Bag(Base):
 
         >>> b.map_partitions(myfunc)  # doctest: +SKIP
 
-        Keyword arguments are passed through to `func`. These can be either
-        `dask.bag.Item`s, or normal python objects.
+        Keyword arguments are passed through to ``func``. These can be either
+        ``dask.bag.Item``, or normal python objects.
 
-        Example
-        -------
+        Examples
+        --------
         >>> import dask.bag as db
         >>> b = db.from_sequence(range(1, 101), npartitions=10)
         >>> def div(nums, den=1):
@@ -424,7 +430,7 @@ class Bag(Base):
         >>> b.map_partitions(div, den=hi).take(5)
         (0.01, 0.02, 0.03, 0.04, 0.05)
 
-        Using an `Item`:
+        Using an ``Item``:
 
         >>> b.map_partitions(div, den=b.max()).take(5)
         (0.01, 0.02, 0.03, 0.04, 0.05)
@@ -468,8 +474,8 @@ class Bag(Base):
     def unzip(self, n):
         """Transform a bag of tuples to ``n`` bags of their elements.
 
-        Example
-        -------
+        Examples
+        --------
         >>> b = from_sequence([(i, i + 1, i + 2) for i in range(10)])
         >>> first, second, third = b.unzip(3)
         >>> isinstance(first, Bag)
@@ -884,7 +890,6 @@ class Bag(Base):
 
         See Also
         --------
-
         Bag.foldby
         """
         if npartitions is None:
@@ -997,6 +1002,50 @@ class Bag(Base):
                                  )))
                    for i in range(npartitions))
         return Bag(merge(self.dask, dsk), name, npartitions)
+
+    def accumulate(self, binop, initial=no_default):
+        """Repeatedly apply binary function to a sequence, accumulating results.
+
+        Examples
+        --------
+        >>> from operator import add
+        >>> b = from_sequence([1, 2, 3, 4, 5], npartitions=2)
+        >>> b.accumulate(add).compute()  # doctest: +SKIP
+        [1, 3, 6, 10, 15]
+
+        Accumulate also takes an optional argument that will be used as the
+        first value.
+
+        >>> b.accumulate(add, -1)  # doctest: +SKIP
+        [-1, 0, 2, 5, 9, 15]
+        """
+        if not _implement_accumulate:
+            raise NotImplementedError("accumulate requires `toolz` > 0.7.4"
+                                      " or `cytoolz` > 0.7.3.")
+        token = tokenize(self, binop, initial)
+        binop_name = funcname(binop)
+        a = '%s-part-%s' % (binop_name, token)
+        b = '%s-first-%s' % (binop_name, token)
+        c = '%s-second-%s' % (binop_name, token)
+        dsk = {(a, 0): (accumulate_part, binop, (self.name, 0), initial, True),
+            (b, 0): (first, (a, 0)),
+            (c, 0): (second, (a, 0))}
+        for i in range(1, self.npartitions):
+            dsk[(a, i)] = (accumulate_part, binop, (self.name, i),
+                        (c, i - 1))
+            dsk[(b, i)] = (first, (a, i))
+            dsk[(c, i)] = (second, (a, i))
+        return Bag(merge(self.dask, dsk), b, self.npartitions)
+
+
+def accumulate_part(binop, seq, initial, is_first=False):
+    if initial == no_default:
+        res = list(accumulate(binop, seq))
+    else:
+        res = list(accumulate(binop, seq, initial=initial))
+    if is_first:
+        return res, res[-1] if res else [], initial
+    return res[1:], res[-1]
 
 
 normalize_token.register(Item, lambda a: a.key)
@@ -1153,15 +1202,15 @@ def from_url(urls):
     >>> a.npartitions  # doctest: +SKIP
     1
 
-    >> a.take(8)  # doctest: +SKIP
-    ('Dask\n',
-     '====\n',
-     '\n',
-     '|Build Status| |Coverage| |Doc Status| |Gitter|\n',
-     '\n',
-     'Dask provides multi-core execution on larger-than-memory datasets using blocked\n',
-     'algorithms and task scheduling.  It maps high-level NumPy and list operations\n',
-     'on large datasets on to graphs of many operations on small in-memory datasets.\n')
+    >>> a.take(8)  # doctest: +SKIP
+    ('Dask\\n',
+     '====\\n',
+     '\\n',
+     '|Build Status| |Coverage| |Doc Status| |Gitter|\\n',
+     '\\n',
+     'Dask provides multi-core execution on larger-than-memory datasets using blocked\\n',
+     'algorithms and task scheduling.  It maps high-level NumPy and list operations\\n',
+     'on large datasets on to graphs of many operations on small in-memory datasets.\\n')
 
     >>> b = from_url(['http://github.com', 'http://google.com'])  # doctest: +SKIP
     >>> b.npartitions  # doctest: +SKIP
@@ -1379,7 +1428,7 @@ def bag_zip(*bags):
     When what you really wanted was more along the lines of:
     >>> list(fizzbuzzz) # doctest: +SKIP
     [(0, 0), (3, None), (None, 5), (6, None), (None 10), (9, None),
-     (12, None), (15, 15), (18, None), (None, 20), (None, 25), (None, 30)]
+    (12, None), (15, 15), (18, None), (None, 20), (None, 25), (None, 30)]
     """
     npartitions = bags[0].npartitions
     assert all(bag.npartitions == npartitions for bag in bags)
